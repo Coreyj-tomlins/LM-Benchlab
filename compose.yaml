@@ -1,0 +1,30 @@
+name: llm-lab
+services:
+  lab:
+    build: .
+    image: modelrig:7.2
+    container_name: llm-concurrency-lab
+    labels:
+      org.opencontainers.image.title: ModelRig
+      org.opencontainers.image.version: "7.2"
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8768:8768"
+    volumes:
+      - history:/data
+    networks:
+      - benchmark
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8768
+      - LLM_LAB_NO_BROWSER=1
+volumes:
+  history:
+networks:
+  benchmark:
+    name: llm-lab-net
