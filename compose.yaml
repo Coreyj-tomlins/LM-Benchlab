@@ -23,6 +23,7 @@ services:
       - APP_HOST=0.0.0.0
       - APP_PORT=8768
       - LLM_LAB_NO_BROWSER=1
+      - LLM_LAB_MASTER_KEY=${LLM_LAB_MASTER_KEY:-}
 volumes:
   history:
 networks:

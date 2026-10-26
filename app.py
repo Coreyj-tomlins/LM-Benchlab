@@ -20,6 +20,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from complex_cases import DEEP_CASES
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+except ImportError:
+    Fernet = None
+    InvalidToken = Exception
 
 APP_HOST = os.getenv('APP_HOST', '0.0.0.0')
 APP_PORT = int(os.getenv('APP_PORT', '8768'))
@@ -31,6 +36,15 @@ RUN_LOCK = threading.Lock()
 JOB_LOCK = threading.Lock()
 JOBS = {}
 ALLOWED_HOST = re.compile(r'^[A-Za-z0-9.-]{1,253}$')
+MASTER_KEY = os.getenv('LLM_LAB_MASTER_KEY', '').strip()
+
+def cipher():
+    if not Fernet or not MASTER_KEY:
+        raise RuntimeError('Encrypted key storage is unavailable; configure LLM_LAB_MASTER_KEY')
+    try:
+        return Fernet(MASTER_KEY.encode('ascii'))
+    except Exception as exc:
+        raise RuntimeError('LLM_LAB_MASTER_KEY must be a valid Fernet key') from exc
 
 def valid_host(name):
     if not isinstance(name, str) or not ALLOWED_HOST.fullmatch(name) or '..' in name:
@@ -80,15 +94,55 @@ def init_db():
             db.execute('ALTER TABLE requests ADD COLUMN reasoning_tokens INTEGER')
         if 'review_guide' not in req_cols:
             db.execute("ALTER TABLE requests ADD COLUMN review_guide TEXT NOT NULL DEFAULT ''")
+        if 'judge_score' not in req_cols:
+            db.execute('ALTER TABLE requests ADD COLUMN judge_score INTEGER')
+        if 'judge_reason' not in req_cols:
+            db.execute("ALTER TABLE requests ADD COLUMN judge_reason TEXT NOT NULL DEFAULT ''")
+        db.execute('''CREATE TABLE IF NOT EXISTS engine_keys (
+            profile_id TEXT PRIMARY KEY, encrypted_key TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )''')
         db.execute('CREATE INDEX IF NOT EXISTS idx_run_date ON runs(timestamp DESC)')
 
 
 def engine_name(port, specified=''):
-    if specified in ('LM Studio','vLLM'):
+    if specified:
         return specified
     if port == 1234: return 'LM Studio'
     if port == 8000: return 'vLLM'
     return f'Custom :{port}'
+
+def save_engine_key(profile_id, api_key):
+    encrypted=cipher().encrypt(api_key.encode('utf-8')).decode('ascii')
+    with DB_LOCK, connect_db() as db:
+        db.execute('INSERT INTO engine_keys(profile_id,encrypted_key,updated_at) VALUES(?,?,?) ON CONFLICT(profile_id) DO UPDATE SET encrypted_key=excluded.encrypted_key,updated_at=excluded.updated_at', (profile_id,encrypted,datetime.now(timezone.utc).isoformat(timespec='seconds')))
+
+def load_engine_key(profile_id):
+    if not profile_id: return ''
+    with connect_db() as db:
+        row=db.execute('SELECT encrypted_key FROM engine_keys WHERE profile_id=?',(profile_id,)).fetchone()
+    if not row: return ''
+    try: return cipher().decrypt(row['encrypted_key'].encode('ascii')).decode('utf-8')
+    except InvalidToken as exc: raise RuntimeError('Stored engine key cannot be decrypted; check LLM_LAB_MASTER_KEY') from exc
+
+def delete_engine_key(profile_id):
+    with DB_LOCK, connect_db() as db: db.execute('DELETE FROM engine_keys WHERE profile_id=?',(profile_id,))
+
+def judge_result(result, judge):
+    if not judge.get('enabled') or not result.get('ok') or not result.get('content'):
+        return result
+    rubric=result.get('review_guide') or 'Accuracy, completeness, safety, and usefulness for the user request.'
+    payload={'model':judge['model'],'messages':[{'role':'system','content':'You are a strict LLM evaluator. Return only valid JSON with integer score from 0 to 5 and a concise reason.'},{'role':'user','content':f'User task:\n{result["user_prompt"]}\n\nModel answer:\n{result["content"]}\n\nEvaluation criteria:\n{rubric}\n\nReturn JSON: {{"score": 0, "reason": "..."}}'}],'temperature':0,'max_tokens':300,'stream':False}
+    try:
+        response=invoke_model(judge['host'],judge['port'],payload,judge.get('timeout',120),judge.get('api_key',''))
+        text=((response.get('choices') or [{}])[0].get('message') or {}).get('content','').strip()
+        match=re.search(r'\{.*\}',text,re.S)
+        parsed=json.loads(match.group(0) if match else text)
+        score=max(0,min(5,int(parsed.get('score'))))
+        result['judge_score']=score;result['judge_reason']=str(parsed.get('reason',''))[:2000]
+    except Exception as exc:
+        result['judge_reason']='Judge error: '+str(exc)[:500]
+    return result
 PROMPTS = [
     ('Juniper WAN link down', 'Juniper MX480', 'xe-0/0/1', 'Administratively up, operationally down. Link lost 9 minutes ago. No CRC errors. Customer primary WAN.'),
     ('Cisco core uplink flapping', 'Cisco C9500', 'TenGigabitEthernet1/0/1', 'Interface flapped six times in 20 minutes. CRC rising. Optical receive power near low warning.'),
@@ -215,11 +269,14 @@ def scenario_for(index, workload='mixed'):
 
 
 
-def invoke_model(host, port, payload, timeout):
+def invoke_model(host, port, payload, timeout, api_key=''):
+    headers={'Content-Type':'application/json'}
+    if api_key:
+        headers['Authorization']='Bearer '+api_key
     req = urllib.request.Request(
         f'http://{host}:{port}/v1/chat/completions',
         data=json.dumps(payload).encode('utf-8'),
-        headers={'Content-Type':'application/json'}, method='POST')
+        headers=headers, method='POST')
     with urllib.request.urlopen(req, timeout=timeout) as res:
         return json.load(res)
 
@@ -232,16 +289,17 @@ DEEP_SYSTEM_PROMPTS = {
 }
 
 
-def investigate(index, host, port, model, max_tokens, temperature, timeout, gate, workload='mixed'):
+def investigate(index, host, port, model, max_tokens, temperature, timeout, gate, workload='mixed', api_key='', prompt_overrides=None):
     category, scenario, question, checks = scenario_for(index, workload)
-    system_prompt = DEEP_SYSTEM_PROMPTS[category] if workload=='deep20' else SYSTEM_PROMPTS[category]
+    defaults = DEEP_SYSTEM_PROMPTS if workload=='deep20' else SYSTEM_PROMPTS
+    system_prompt = (prompt_overrides or {}).get(category) or defaults[category]
     payload = {'model':model, 'messages':[{'role':'system','content':system_prompt},
                                          {'role':'user','content':question}],
                'max_tokens':max_tokens, 'temperature':temperature, 'stream':False}
     gate.wait()
     start = time.perf_counter()
     try:
-        response = invoke_model(host,port,payload,timeout)
+        response = invoke_model(host,port,payload,timeout,api_key)
         secs = time.perf_counter()-start
         choice = (response.get('choices') or [{}])[0]
         msg = choice.get('message') or {}
@@ -311,12 +369,12 @@ def save_run(summary, results, settings):
             summary['avg_request_seconds'],summary['output_tokens'],settings['max_inflight'],settings['workload']))
         db.executemany('''INSERT INTO requests (
           run_id,request_index,category,scenario,system_prompt,user_prompt,ok,seconds,
-          completion_tokens,prompt_tokens,tokens_per_second,finish_reason,content,reasoning,error,review,reasoning_tokens,review_guide
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',[(
+                    completion_tokens,prompt_tokens,tokens_per_second,finish_reason,content,reasoning,error,review,reasoning_tokens,review_guide,judge_score,judge_reason
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',[(
             summary['run_id'],r['index'],r['category'],r['scenario'],r['system_prompt'],
             r['user_prompt'],int(r['ok']),r['seconds'],r['completion_tokens'],r['prompt_tokens'],
             r['tokens_per_second'],r['finish_reason'],r['content'],r['reasoning'],r['error'],r['review'],
-            r['reasoning_tokens'],r['review_guide'])
+            r['reasoning_tokens'],r['review_guide'],r.get('judge_score'),r.get('judge_reason',''))
             for r in results])
 
 
@@ -368,7 +426,7 @@ def export_csv(run_id):
           'aggregate_tokens_per_second','succeeded','total','workload','correct','incorrect','unreviewed',
           'index','category','scenario','ok','review','seconds','completion_tokens',
           'prompt_tokens','tokens_per_second','finish_reason','system_prompt','user_prompt',
-          'content','reasoning','reasoning_tokens','review_guide','error']
+          'content','reasoning','reasoning_tokens','review_guide','judge_score','judge_reason','error']
     buf=io.StringIO(newline='')
     writer=csv.DictWriter(buf,fieldnames=cols)
     writer.writeheader()
@@ -385,12 +443,12 @@ def run_benchmark(run_id, settings):
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(n,settings['max_inflight']),thread_name_prefix='llm') as pool:
             futures=[pool.submit(investigate,i,settings['host'],settings['port'],
                                  settings['model'],settings['max_tokens'],settings['temperature'],
-                                 settings['timeout'],gate,settings['workload']) for i in range(n)]
+                                 settings['timeout'],gate,settings['workload'],settings['api_key'],settings['prompt_overrides']) for i in range(n)]
             started=time.perf_counter()
             gate.set()
             results=[]
             for f in concurrent.futures.as_completed(futures):
-                r=f.result()
+                r=judge_result(f.result(),settings['judge'])
                 results.append(r)
                 with JOB_LOCK:
                     j=JOBS[run_id]
@@ -451,7 +509,10 @@ class Handler(BaseHTTPRequestHandler):
                 port=int(args.get('port',['1234'])[0])
                 host=valid_host(args.get('host',['host.docker.internal'])[0])
                 if not 1<=port<=65535: raise ValueError('Invalid port')
-                with urllib.request.urlopen(f'http://{host}:{port}/v1/models',timeout=12) as res:
+                profile_id=args.get('profile_id',[''])[0]
+                api_key=load_engine_key(profile_id) if profile_id else self.headers.get('X-LLM-API-Key','')
+                req=urllib.request.Request(f'http://{host}:{port}/v1/models',headers={'Authorization':'Bearer '+api_key} if api_key else {})
+                with urllib.request.urlopen(req,timeout=12) as res:
                     data=json.load(res)
                 self.json_response(200,{'models':[m['id'] for m in data.get('data',[])]})
             except Exception as exc:
@@ -488,7 +549,7 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(404,{'error':'Unknown endpoint'})
 
     def do_POST(self):
-        if self.path not in ('/api/run','/api/review'):
+        if self.path not in ('/api/run','/api/review','/api/engine-key','/api/engine-key/delete','/api/test-connection'):
             self.json_response(404,{'error':'Unknown endpoint'});return
         try:
             length=int(self.headers.get('Content-Length','0'))
@@ -497,6 +558,38 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(args,dict): raise ValueError('Expected JSON object')
         except (ValueError,TypeError,json.JSONDecodeError) as exc:
             self.json_response(400,{'error':str(exc)});return
+        if self.path=='/api/test-connection':
+            try:
+                host=valid_host(str(args.get('host','')))
+                port=int(args.get('port'))
+                if not 1<=port<=65535: raise ValueError('Invalid port')
+                profile_id=str(args.get('profile_id','')).strip()
+                api_key=str(args.get('api_key','')).strip()
+                if profile_id and api_key:
+                    save_engine_key(profile_id,api_key)
+                elif profile_id:
+                    api_key=load_engine_key(profile_id)
+                req=urllib.request.Request(f'http://{host}:{port}/v1/models',headers={'Authorization':'Bearer '+api_key} if api_key else {})
+                with urllib.request.urlopen(req,timeout=12) as res: data=json.load(res)
+                models=[m.get('id') for m in data.get('data',[]) if m.get('id')]
+                self.json_response(200,{'connected':True,'models':models,'model_count':len(models)})
+            except Exception as exc:
+                self.json_response(502,{'connected':False,'error':str(exc)})
+            return
+        if self.path in ('/api/engine-key','/api/engine-key/delete'):
+            try:
+                profile_id=str(args['profile_id'])
+                if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',profile_id): raise ValueError('Invalid engine profile id')
+                if self.path.endswith('/delete'):
+                    delete_engine_key(profile_id)
+                else:
+                    api_key=str(args.get('api_key','')).strip()
+                    if not api_key: raise ValueError('API key is required')
+                    save_engine_key(profile_id,api_key)
+                self.json_response(200,{'stored':True})
+            except (ValueError,RuntimeError,KeyError) as exc:
+                self.json_response(400,{'error':str(exc)})
+            return
         if self.path=='/api/review':
             try:
                 run_id=str(args['run_id'])
@@ -531,12 +624,27 @@ class Handler(BaseHTTPRequestHandler):
             if workload=='deep20' and n!=20:
                 raise ValueError('Deep reasoning suite requires exactly 20 requests')
             specified=str(args.get('engine',''))
+            profile_id=str(args.get('profile_id','')).strip()
+            api_key=str(args.get('api_key','')).strip()
+            if profile_id and api_key:
+                save_engine_key(profile_id,api_key)
+            elif profile_id:
+                api_key=load_engine_key(profile_id)
+            prompt_overrides=args.get('prompt_overrides',{})
+            if not isinstance(prompt_overrides,dict):
+                raise ValueError('Prompt overrides must be an object')
+            prompt_overrides={str(k):str(v)[:10000] for k,v in prompt_overrides.items() if str(v).strip()}
+            judge=args.get('judge',{})
+            if not isinstance(judge,dict): raise ValueError('Judge settings must be an object')
+            judge={'enabled':bool(judge.get('enabled',False)),'host':valid_host(str(judge.get('host','host.docker.internal'))),'port':int(judge.get('port',1234)),'model':str(judge.get('model','')),'api_key':str(judge.get('apiKey','')),'timeout':120}
+            if judge['enabled'] and (not judge['model'] or not 1<=judge['port']<=65535):
+                raise ValueError('Enabled judge requires a model and valid port')
         except (ValueError,TypeError,KeyError) as exc:
             self.json_response(400,{'error':str(exc)});return
         if not RUN_LOCK.acquire(blocking=False):
             self.json_response(409,{'error':'Another benchmark is already running'});return
         run_id=uuid.uuid4().hex
-        settings={'host':host,'port':port,'model':model,'concurrency':n,'max_inflight':max_inflight,'max_tokens':max_tokens,'timeout':timeout,'temperature':temperature,'specified_engine':specified,'workload':workload}
+        settings={'host':host,'port':port,'model':model,'concurrency':n,'max_inflight':max_inflight,'max_tokens':max_tokens,'timeout':timeout,'temperature':temperature,'specified_engine':specified,'workload':workload,'api_key':api_key,'prompt_overrides':prompt_overrides,'judge':judge}
         with JOB_LOCK:
             JOBS[run_id]={'run_id':run_id,'state':'running','started_at':time.perf_counter(),
                           'completed':0,'successes':0,'errors':0,'total':n,'error':''}

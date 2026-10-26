@@ -17,6 +17,8 @@ ModelRig is a self-hosted, Dockerised browser application for benchmarking LM St
 - Reworked the sidebar service/footer information so the Docker, SQLite, API and version labels do not crowd each other.
 - Added a light/dark toggle in the top bar. The selection persists in the browser using localStorage, including after page reloads.
 - Benchmark engine, History, manual reviews, API contract, Compose project and named Docker volume are unchanged.
+- Add multiple local engine profiles, including optional bearer API keys, from the benchmark setup screen.
+- Edit system prompts and workspace version labels from Settings. An optional LLM judge can score successful responses from 0 to 5 and save its rationale with the run.
 
 ## Original v7 features
 
@@ -97,6 +99,9 @@ These are starting values, not performance guarantees. Run one inference server 
 - Click a saved run and then a request to inspect its conversation and mark Correct / Incorrect / Unreviewed.
 - Export the selected run as CSV.
 - The Compare screen displays existing saved-run metrics; it does not modify them.
+- LLM judge keys are stored in browser local storage and sent only to the configured endpoint. Do not use this feature on a shared browser profile or store production secrets in the repository.
+- Engine API keys are encrypted at rest by the backend with `LLM_LAB_MASTER_KEY`; the plaintext key is not stored in SQLite. Copy `.env.example` to `.env`, generate a Fernet key with the documented command, and keep that master key backed up and unchanged.
+- The judge is an assistant for review, not ground truth. Inspect its score and rationale alongside manual review.
 
 SQLite is stored unencrypted in Docker volume `llm-lab_history` (Compose volume `history`). **Use synthetic benchmark evidence and avoid customer secrets**. This is a local test tool without authentication; do not expose port 8768 outside localhost.
 
