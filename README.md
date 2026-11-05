@@ -70,7 +70,9 @@ docker network connect llm-lab-net vllm
 
 Run `docker network inspect llm-lab-net` to confirm both containers appear. Docker will return an error if `vllm` is already connected; that is harmless.
 
-In the dashboard choose **vLLM**, host `vllm`, port `8000`. The network alias works only if the inference container is named `vllm`; if different, use that container name instead.
+In the dashboard choose **vLLM**, host `host.docker.internal`, port `8000`. This is the default for a vLLM server running on the Docker host. If vLLM runs in another container, use its Docker-network hostname instead.
+
+Custom engines may also use a complete OpenAI-compatible base URL, such as `https://10.10.30.100/v1`. Leave the port blank when the URL includes its scheme and path. The endpoint must use `http://` or `https://` and must not include credentials, query parameters or fragments.
 
 If running vLLM elsewhere, set the hostname reachable **from within the lab container**, not from your browser.
 
@@ -80,6 +82,10 @@ If running vLLM elsewhere, set the hostname reachable **from within the lab cont
 
 **Deep reasoning:** exactly 20 more demanding multi-step tasks (five in each category). The app includes review checklists with each case; these are for human evaluation, not automatic grading.
 
+**Agentic Python mission:** exactly 12 sequential phases for one synthetic `eventledger` Python project. The model receives the prior phase output before each next phase and is asked to move from requirements and design through implementation, testing, debugging, security review and maintainer handoff. This measures state retention, tool-like planning, self-correction and software-engineering judgment rather than independent prompt quality.
+
+**Conversation speed test:** exactly 20 sequential support messages in one synthetic IT helpdesk conversation. Each response receives the accumulated transcript, allowing you to measure per-message latency alongside context retention, follow-up quality and troubleshooting continuity.
+
 **Total requests** sets how many cases to submit. **Max in-flight** sets how many HTTP requests can be active at once (the rest are queued within the lab). vLLM may additionally limit simultaneous GPU sequences with `--max-num-seqs`. Increasing accepted requests doesn't guarantee greater model throughput.
 
 Recommended starting point for a 10GB RTX 3080 and Qwen3-4B-Thinking-2507:
@@ -88,6 +94,8 @@ Recommended starting point for a 10GB RTX 3080 and Qwen3-4B-Thinking-2507:
 |---|---:|---:|---:|---:|
 | Mixed stress | 100 | 16–32 | 1536 | 900 s |
 | Deep reasoning | 20 | 4 | 4096 | 1200 s |
+| Agentic Python | 12 | 1 | 4096 | 1200 s |
+| Conversation speed | 20 | 1 | 1024 | 900 s |
 
 These are starting values, not performance guarantees. Run one inference server at a time on a single GPU, keeping quantisation/model/context settings comparable.
 
@@ -137,4 +145,4 @@ If fetching models fails, verify container-to-engine networking and the server's
 - Database: SQLite in persistent Docker named volume
 - Endpoint: `127.0.0.1:8768` on the Docker host
 
-The benchmark backend and database schema are preserved from v6; v7.3 updates only the brand identity and documentation. The Compose project remains `llm-lab` so existing volumes and Docker-network integrations are not disrupted.
+The benchmark backend and database schema are preserved from v6; v7.3 retains the existing suites and adds the sequential Agentic Python mission. The Compose project remains `llm-lab` so existing volumes and Docker-network integrations are not disrupted.

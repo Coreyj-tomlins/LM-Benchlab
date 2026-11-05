@@ -18,8 +18,8 @@ import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
-from complex_cases import DEEP_CASES
+from urllib.parse import parse_qs, urlparse, urlsplit
+from complex_cases import AGENTIC_CASES, CONVERSATION_CASES, DEEP_CASES
 try:
     from cryptography.fernet import Fernet, InvalidToken
 except ImportError:
@@ -50,6 +50,25 @@ def valid_host(name):
     if not isinstance(name, str) or not ALLOWED_HOST.fullmatch(name) or '..' in name:
         raise ValueError('Host must be a hostname or IP without http:// or a port')
     return name
+
+def endpoint_url(host, port, resource):
+    raw=str(host or '').strip()
+    if '://' in raw:
+        parsed=urlsplit(raw)
+        if parsed.scheme not in ('http','https') or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError('Endpoint must be an http:// or https:// URL without credentials, query, or fragment')
+        try:
+            parsed.port
+        except ValueError as exc:
+            raise ValueError('Endpoint has an invalid port') from exc
+        base=raw.rstrip('/')
+        if not parsed.path.rstrip('/').endswith('/v1'):
+            base+='/v1'
+        return base+'/'+resource.lstrip('/')
+    valid_host(raw)
+    if not isinstance(port,int) or not 1<=port<=65535:
+        raise ValueError('A port from 1 to 65535 is required for hostname endpoints')
+    return f'http://{raw}:{port}/v1/{resource.lstrip("/")}'
 
 
 
@@ -252,6 +271,12 @@ SYSTEM_PROMPTS = {
 }
 
 def scenario_for(index, workload='mixed'):
+    if workload == 'chat20':
+        case=CONVERSATION_CASES[index % len(CONVERSATION_CASES)]
+        return case['category'], case['title'], case['prompt'], case['checks']
+    if workload == 'agentic12':
+        case=AGENTIC_CASES[index % len(AGENTIC_CASES)]
+        return case['category'], case['title'], case['prompt'], case['checks']
     if workload == 'deep20':
         case=DEEP_CASES[index % len(DEEP_CASES)]
         return case['category'], case['title'], case['prompt'], case['checks']
@@ -274,7 +299,7 @@ def invoke_model(host, port, payload, timeout, api_key=''):
     if api_key:
         headers['Authorization']='Bearer '+api_key
     req = urllib.request.Request(
-        f'http://{host}:{port}/v1/chat/completions',
+        endpoint_url(host,port,'chat/completions'),
         data=json.dumps(payload).encode('utf-8'),
         headers=headers, method='POST')
     with urllib.request.urlopen(req, timeout=timeout) as res:
@@ -287,12 +312,16 @@ DEEP_SYSTEM_PROMPTS = {
  'Chat': 'You are an experienced enterprise IT support engineer. Respond to the latest turn of the provided conversation, take account of previous messages and user constraints, and provide a safe and practical step-by-step resolution with a concise explanation and clear escalation or rollback conditions. Never fabricate actions already performed.',
  'Sales': 'You are a rigorous MSSP solutions consultant. Work through numerical assumptions accurately; distinguish calculations from unknown commercial inputs, avoid invented prices, and develop a realistic decision-ready recommendation with explicit caveats and measurable next steps. Explain the important assumptions and checks in the final answer.'
 }
+AGENTIC_SYSTEM_PROMPT = '''You are a senior Python engineer working through a stateful, multi-phase software task. Treat prior phase outputs as working project context, but verify them instead of blindly trusting them. Make concrete, executable recommendations and code when requested. Preserve acceptance criteria, surface contradictions, do not claim to have run commands you did not run, and leave a clear handoff for the next phase.'''
+CONVERSATION_SYSTEM_PROMPT = '''You are a helpful IT support assistant in an ongoing chat. Use the complete prior conversation as context, respond naturally to the latest user message, and do not repeat questions that were already answered. Give one or two practical next steps, distinguish evidence from guesses, protect secrets, and keep the reply concise enough for a real-time support conversation. Do not claim to have performed actions.'''
 
 
-def investigate(index, host, port, model, max_tokens, temperature, timeout, gate, workload='mixed', api_key='', prompt_overrides=None):
+def investigate(index, host, port, model, max_tokens, temperature, timeout, gate, workload='mixed', api_key='', prompt_overrides=None, conversation_context=''):
     category, scenario, question, checks = scenario_for(index, workload)
-    defaults = DEEP_SYSTEM_PROMPTS if workload=='deep20' else SYSTEM_PROMPTS
-    system_prompt = (prompt_overrides or {}).get(category) or defaults[category]
+    defaults = CONVERSATION_SYSTEM_PROMPT if workload=='chat20' else (AGENTIC_SYSTEM_PROMPT if workload=='agentic12' else (DEEP_SYSTEM_PROMPTS if workload=='deep20' else SYSTEM_PROMPTS))
+    system_prompt = (prompt_overrides or {}).get(category) or (defaults if isinstance(defaults,str) else defaults[category])
+    if conversation_context:
+        question = 'PROJECT CONTEXT FROM EARLIER PHASES:\n'+conversation_context+'\n\nCURRENT PHASE:\n'+question
     payload = {'model':model, 'messages':[{'role':'system','content':system_prompt},
                                          {'role':'user','content':question}],
                'max_tokens':max_tokens, 'temperature':temperature, 'stream':False}
@@ -348,7 +377,7 @@ def investigate(index, host, port, model, max_tokens, temperature, timeout, gate
 
 def grouped_results(results):
     groups=[]
-    for category in SYSTEM_PROMPTS:
+    for category in dict.fromkeys(r['category'] for r in results):
         sub=[r for r in results if r['category']==category]
         good=[r for r in sub if r['ok']]
         groups.append({'category':category,'total':len(sub), 'succeeded':len(good),
@@ -440,22 +469,24 @@ def run_benchmark(run_id, settings):
     try:
         n=settings['concurrency']
         gate=threading.Event()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(n,settings['max_inflight']),thread_name_prefix='llm') as pool:
-            futures=[pool.submit(investigate,i,settings['host'],settings['port'],
-                                 settings['model'],settings['max_tokens'],settings['temperature'],
-                                 settings['timeout'],gate,settings['workload'],settings['api_key'],settings['prompt_overrides']) for i in range(n)]
-            started=time.perf_counter()
-            gate.set()
-            results=[]
-            for f in concurrent.futures.as_completed(futures):
-                r=judge_result(f.result(),settings['judge'])
-                results.append(r)
+        started=time.perf_counter(); results=[]
+        if settings['workload'] in ('agentic12','chat20'):
+            gate.set(); context=''
+            for i in range(n):
+                r=investigate(i,settings['host'],settings['port'],settings['model'],settings['max_tokens'],settings['temperature'],settings['timeout'],gate,settings['workload'],settings['api_key'],settings['prompt_overrides'],context)
+                r=judge_result(r,settings['judge']); results.append(r)
+                context=(context+'\n\nPHASE '+str(i+1)+' MODEL OUTPUT:\n'+(r.get('content') or r.get('error') or ''))[-60000:]
                 with JOB_LOCK:
-                    j=JOBS[run_id]
-                    j['completed']+=1
-                    j['successes']+=int(r['ok'])
-                    j['errors']+=int(not r['ok'])
-            wall=time.perf_counter()-started
+                    j=JOBS[run_id];j['completed']+=1;j['successes']+=int(r['ok']);j['errors']+=int(not r['ok'])
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(n,settings['max_inflight']),thread_name_prefix='llm') as pool:
+                futures=[pool.submit(investigate,i,settings['host'],settings['port'],settings['model'],settings['max_tokens'],settings['temperature'],settings['timeout'],gate,settings['workload'],settings['api_key'],settings['prompt_overrides']) for i in range(n)]
+                gate.set()
+                for f in concurrent.futures.as_completed(futures):
+                    r=judge_result(f.result(),settings['judge']); results.append(r)
+                    with JOB_LOCK:
+                        j=JOBS[run_id];j['completed']+=1;j['successes']+=int(r['ok']);j['errors']+=int(not r['ok'])
+        wall=time.perf_counter()-started
         results.sort(key=lambda r:r['index'])
         good=[r for r in results if r['ok']]
         output_tokens=sum(r['completion_tokens'] or 0 for r in good)
@@ -506,12 +537,12 @@ class Handler(BaseHTTPRequestHandler):
         elif path=='/api/models':
             try:
                 args=parse_qs(parsed.query)
-                port=int(args.get('port',['1234'])[0])
-                host=valid_host(args.get('host',['host.docker.internal'])[0])
-                if not 1<=port<=65535: raise ValueError('Invalid port')
+                host=args.get('host',['host.docker.internal'])[0]
+                port_text=args.get('port',['1234'])[0].strip()
+                port=int(port_text) if port_text else 0
                 profile_id=args.get('profile_id',[''])[0]
                 api_key=load_engine_key(profile_id) if profile_id else self.headers.get('X-LLM-API-Key','')
-                req=urllib.request.Request(f'http://{host}:{port}/v1/models',headers={'Authorization':'Bearer '+api_key} if api_key else {})
+                req=urllib.request.Request(endpoint_url(host,port,'models'),headers={'Authorization':'Bearer '+api_key} if api_key else {})
                 with urllib.request.urlopen(req,timeout=12) as res:
                     data=json.load(res)
                 self.json_response(200,{'models':[m['id'] for m in data.get('data',[])]})
@@ -560,16 +591,16 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(400,{'error':str(exc)});return
         if self.path=='/api/test-connection':
             try:
-                host=valid_host(str(args.get('host','')))
-                port=int(args.get('port'))
-                if not 1<=port<=65535: raise ValueError('Invalid port')
+                host=str(args.get('host','')).strip()
+                port_text=str(args.get('port','')).strip()
+                port=int(port_text) if port_text else 0
                 profile_id=str(args.get('profile_id','')).strip()
                 api_key=str(args.get('api_key','')).strip()
                 if profile_id and api_key:
                     save_engine_key(profile_id,api_key)
                 elif profile_id:
                     api_key=load_engine_key(profile_id)
-                req=urllib.request.Request(f'http://{host}:{port}/v1/models',headers={'Authorization':'Bearer '+api_key} if api_key else {})
+                req=urllib.request.Request(endpoint_url(host,port,'models'),headers={'Authorization':'Bearer '+api_key} if api_key else {})
                 with urllib.request.urlopen(req,timeout=12) as res: data=json.load(res)
                 models=[m.get('id') for m in data.get('data',[]) if m.get('id')]
                 self.json_response(200,{'connected':True,'models':models,'model_count':len(models)})
@@ -607,22 +638,27 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            port=int(args['port'])
-            host=valid_host(args.get('host','host.docker.internal'))
+            host=str(args.get('host','host.docker.internal')).strip()
+            port=int(args.get('port',0) or 0)
             n=int(args['concurrency'])
             max_inflight=int(args.get('max_inflight',n))
             model=str(args['model'])
             max_tokens=int(args['max_tokens'])
             timeout=int(args['timeout'])
             temperature=float(args['temperature'])
-            if not (1<=port<=65535 and 1<=n<=MAX_REQUESTS and 1<=max_inflight<=MAX_REQUESTS and 64<=max_tokens<=8192 and
+            endpoint_url(host,port,'models')
+            if not (1<=n<=MAX_REQUESTS and 1<=max_inflight<=MAX_REQUESTS and 64<=max_tokens<=8192 and
                     15<=timeout<=3600 and 0<=temperature<=2 and 0<len(model)<=300):
                 raise ValueError('One or more settings are outside allowed limits')
             workload=str(args.get('workload','mixed'))
-            if workload not in ('mixed','deep20'):
+            if workload not in ('mixed','deep20','agentic12','chat20'):
                 raise ValueError('Unknown benchmark suite')
             if workload=='deep20' and n!=20:
                 raise ValueError('Deep reasoning suite requires exactly 20 requests')
+            if workload=='agentic12' and n!=12:
+                raise ValueError('Agentic Python suite requires exactly 12 sequential phases')
+            if workload=='chat20' and n!=20:
+                raise ValueError('Conversation speed suite requires exactly 20 sequential messages')
             specified=str(args.get('engine',''))
             profile_id=str(args.get('profile_id','')).strip()
             api_key=str(args.get('api_key','')).strip()
