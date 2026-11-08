@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""ModelRig v7.2 — 500-load and 20-case deep-thinking benchmarks.
-Python 3.9+, standard library only. Windows / Linux, localhost-only API and UI.
+"""LM Benchlab — configurable, general-purpose LLM benchmarks.
+Python 3.10+, with cryptography for optional encrypted API key storage.
 """
 import concurrent.futures
 import csv
 import io
+import ipaddress
 import json
-import os
 import re
 import sqlite3
 import threading
@@ -15,36 +15,48 @@ import urllib.error
 import urllib.request
 import uuid
 import webbrowser
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse, urlsplit
-from complex_cases import AGENTIC_CASES, CONVERSATION_CASES, DEEP_CASES
+from config import APP_NAME, APP_SLUG, ConfigurationError, VERSION, load_config
+from complex_cases import AGENTIC_CASES, CONVERSATION_CASES, DEEP_CASES as LEGACY_DEEP_CASES
+from prompt_catalog import (CATEGORY_IDS, EXTRA_DEEP_CASES, EXTRA_DEEP_SYSTEM_PROMPTS,
+                            MIXED_CASES, PROMPT_TYPES, SYSTEM_PROMPTS)
+DEEP_CASES = [case for case in LEGACY_DEEP_CASES if case['category'] in ('Interface', 'SIEM')]
 try:
     from cryptography.fernet import Fernet, InvalidToken
 except ImportError:
     Fernet = None
     InvalidToken = Exception
 
-APP_HOST = os.getenv('APP_HOST', '0.0.0.0')
-APP_PORT = int(os.getenv('APP_PORT', '8768'))
+try:
+    CONFIG = load_config()
+except ConfigurationError as exc:
+    if __name__ == '__main__':
+        raise SystemExit(f'Configuration error: {exc}') from None
+    raise
+
+APP_HOST = CONFIG.host
+APP_PORT = CONFIG.port
+DEFAULT_ENGINE_HOST = CONFIG.default_engine_host
 MAX_REQUESTS = 500
-DB_PATH = Path(os.getenv('LLM_LAB_DB', '/data/llm_concurrency_history.sqlite3'))
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+DB_PATH = CONFIG.db_path
 DB_LOCK = threading.Lock()
 RUN_LOCK = threading.Lock()
 JOB_LOCK = threading.Lock()
 JOBS = {}
 ALLOWED_HOST = re.compile(r'^[A-Za-z0-9.-]{1,253}$')
-MASTER_KEY = os.getenv('LLM_LAB_MASTER_KEY', '').strip()
+MASTER_KEY = CONFIG.master_key
 
 def cipher():
     if not Fernet or not MASTER_KEY:
-        raise RuntimeError('Encrypted key storage is unavailable; configure LLM_LAB_MASTER_KEY')
+        raise RuntimeError('Encrypted key storage is unavailable; configure LM_BENCHLAB_MASTER_KEY')
     try:
         return Fernet(MASTER_KEY.encode('ascii'))
     except Exception as exc:
-        raise RuntimeError('LLM_LAB_MASTER_KEY must be a valid Fernet key') from exc
+        raise RuntimeError('LM_BENCHLAB_MASTER_KEY must be a valid Fernet key') from exc
 
 def valid_host(name):
     if not isinstance(name, str) or not ALLOWED_HOST.fullmatch(name) or '..' in name:
@@ -71,16 +83,36 @@ def endpoint_url(host, port, resource):
     return f'http://{raw}:{port}/v1/{resource.lstrip("/")}'
 
 
+class SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        def origin(url):
+            parts = urlsplit(url)
+            return parts.scheme, parts.hostname, parts.port or (443 if parts.scheme == 'https' else 80)
+        if origin(req.full_url) != origin(newurl):
+            raise ValueError('Inference endpoint redirected to a different origin; configure its final URL directly')
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
+
+def open_endpoint(request, timeout):
+    return urllib.request.build_opener(SameOriginRedirectHandler()).open(request, timeout=timeout)
+
+
+
+@contextmanager
 def connect_db():
     db = sqlite3.connect(str(DB_PATH), timeout=30)
     db.row_factory = sqlite3.Row
-    db.execute('PRAGMA foreign_keys=ON')
-    db.execute('PRAGMA busy_timeout=30000')
-    return db
+    try:
+        db.execute('PRAGMA foreign_keys=ON')
+        db.execute('PRAGMA busy_timeout=30000')
+        with db:
+            yield db
+    finally:
+        db.close()
 
 
 def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with connect_db() as db:
         db.execute('''CREATE TABLE IF NOT EXISTS runs (
             id TEXT PRIMARY KEY, timestamp TEXT NOT NULL,
@@ -108,6 +140,9 @@ def init_db():
             db.execute('ALTER TABLE runs ADD COLUMN max_inflight INTEGER NOT NULL DEFAULT 0')
         if 'workload' not in [r[1] for r in db.execute('PRAGMA table_info(runs)')]:
             db.execute("ALTER TABLE runs ADD COLUMN workload TEXT NOT NULL DEFAULT 'mixed'")
+        if 'enabled_categories' not in [r[1] for r in db.execute('PRAGMA table_info(runs)')]:
+            # NULL distinguishes historical runs whose selection was not recorded.
+            db.execute('ALTER TABLE runs ADD COLUMN enabled_categories TEXT')
         req_cols=[r[1] for r in db.execute('PRAGMA table_info(requests)')]
         if 'reasoning_tokens' not in req_cols:
             db.execute('ALTER TABLE requests ADD COLUMN reasoning_tokens INTEGER')
@@ -142,7 +177,7 @@ def load_engine_key(profile_id):
         row=db.execute('SELECT encrypted_key FROM engine_keys WHERE profile_id=?',(profile_id,)).fetchone()
     if not row: return ''
     try: return cipher().decrypt(row['encrypted_key'].encode('ascii')).decode('utf-8')
-    except InvalidToken as exc: raise RuntimeError('Stored engine key cannot be decrypted; check LLM_LAB_MASTER_KEY') from exc
+    except InvalidToken as exc: raise RuntimeError('Stored engine key cannot be decrypted; check LM_BENCHLAB_MASTER_KEY') from exc
 
 def delete_engine_key(profile_id):
     with DB_LOCK, connect_db() as db: db.execute('DELETE FROM engine_keys WHERE profile_id=?',(profile_id,))
@@ -180,8 +215,7 @@ PROMPTS = [
     ('Arista EVPN uplink', 'Arista 7050X', 'Ethernet49/1', 'Uplink up/up but intermittent discards. EVPN peer reachability impacted during peak traffic.'),
 ]
 
-# Each request uses a distinct synthetic scenario. Four categories are interleaved
-# so any request count from 1 to 100 includes a representative mix.
+# Domain-specific scenarios remain available alongside the general catalog.
 SIEM_CASES = [
  ('Impossible travel', 'Entra ID sign-ins from London and Singapore within 8 minutes; MFA succeeded on one session.'),
  ('Password spray', '146 failed Azure AD sign-ins for 42 users from 203.0.113.44; 2 successful logins.'),
@@ -209,85 +243,52 @@ SIEM_CASES = [
  ('Rare process execution', 'Sysmon records rundll32 launching unexpected DLL from Downloads.'),
  ('Email forwarding rule', 'New inbox forwarding rule sends finance mail to external domain.'),
 ]
-CHAT_CASES = [
- ('VPN connection', 'My VPN connects but I cannot reach the internal file server. What should I check?'),
- ('Wi-Fi instability', 'My laptop Wi-Fi disconnects every few minutes; can you help me troubleshoot?'),
- ('Password manager', 'How do I move to a password manager safely for my small team?'),
- ('Slow video call', 'Teams calls lag when working from home; what diagnostics should I try?'),
- ('MFA setup', 'I have a new phone. How should I move my MFA accounts without locking myself out?'),
- ('Printer VLAN', 'I can ping my printer but printing fails across VLANs. What next?'),
- ('Small office network', 'Explain the difference between a router, switch and firewall simply.'),
- ('Phishing advice', 'I clicked a suspicious link but did not enter credentials. What should I do?'),
- ('DNS troubleshooting', 'Some websites work and others fail for my laptop only. What could be wrong?'),
- ('Patch scheduling', 'How should we schedule security patches for servers with limited downtime?'),
- ('Guest Wi-Fi', 'What is a safe way to offer guest Wi-Fi in an office?'),
- ('Workstation backup', 'Explain 3-2-1 backups for a nontechnical business owner.'),
- ('Access request', 'Draft a friendly reply asking for manager approval for elevated access.'),
- ('Network monitoring', 'How can monitoring tell me the difference between an outage and slowness?'),
- ('Public IP explanation', 'Why does my home network have a public IP and private IPs?'),
- ('Certificate warning', 'My browser reports an invalid certificate on an internal portal. What now?'),
- ('File share permissions', 'How do I request access to a team file share appropriately?'),
- ('Two-factor methods', 'Compare authenticator apps with SMS codes for a small business.'),
- ('Zero trust overview', 'What does zero trust mean in plain English?'),
- ('Home router security', 'What are five safe settings to review on a home router?'),
- ('Network diagram', 'Explain what information a useful network diagram should contain.'),
- ('Meeting recap', 'Write a concise meeting recap for a discussion about a firewall upgrade.'),
- ('Remote work policy', 'What are practical network security recommendations for remote workers?'),
- ('IT onboarding', 'Outline a first-day IT onboarding checklist for a new employee.'),
- ('Incident status', 'Write a clear nontechnical status update for an intermittent WAN outage.'),
-]
-SALES_CASES = [
- ('MSSP discovery', 'Create five discovery questions for a 150-user business evaluating managed SOC.'),
- ('SOC proposal', 'Draft a short managed SOC value proposition for a manufacturing company.'),
- ('Firewall refresh', 'Write an outreach email proposing a next-generation firewall assessment.'),
- ('Service tiers', 'Explain a simple three-tier managed network monitoring service offering.'),
- ('Renewal objection', 'Customer says managed monitoring is too expensive; propose a consultative response.'),
- ('Customer follow-up', 'Draft a friendly follow-up after a first network security discovery call.'),
- ('Executive summary', 'Summarise benefits of 24/7 alert triage for a nontechnical CFO.'),
- ('Cross-sell', 'Suggest ethical opportunities to discuss SIEM with an existing network monitoring customer.'),
- ('Proposal scope', 'Create a scope outline for firewall configuration review and recommendations.'),
- ('ROI questions', 'List questions needed to quantify the value of automated incident investigations.'),
- ('Competitive differentiation', 'Explain non-hype differentiators for a mid-sized MSSP.'),
- ('Onboarding timeline', 'Draft a high-level 30-day onboarding plan for managed monitoring.'),
- ('Customer objections', 'Answer a prospect worried about false positives in a managed SIEM.'),
- ('Quarterly review', 'Suggest useful KPIs for a quarterly managed security service review.'),
- ('Risk reduction', 'Translate vulnerability remediation into an executive business benefit.'),
- ('Service description', 'Write a 120-word description of an interface-down investigation service.'),
- ('SLA language', 'Explain the difference between response SLA and resolution target.'),
- ('Requirements checklist', 'Create a short customer questionnaire for managed network monitoring.'),
- ('Stakeholder pitch', 'Write a 1-minute pitch for an IT director considering SOC outsourcing.'),
- ('Pricing framework', 'Describe inputs for a managed SIEM pricing model without inventing prices.'),
- ('RFP response', 'Draft a concise response to an RFP question about incident escalation.'),
- ('Customer success', 'Suggest three proactive touchpoints during the first 60 days of service.'),
- ('Partner referral', 'Draft an introductory email to a potential managed security channel partner.'),
- ('Board presentation', 'Create a short outline explaining cyber monitoring investment to a board.'),
- ('Upsell timing', 'Suggest when to raise a backup monitoring service in a customer conversation.'),
-]
-SYSTEM_PROMPTS = {
- 'Interface': 'You are a senior MSSP network engineer. Use only supplied evidence; never invent test results. Respond with likely causes, three vendor-specific commands, next steps, and escalation criteria. Keep it concise.',
- 'SIEM': 'You are a senior SOC analyst. Use only evidence supplied, do not assert compromise without proof. Give severity with justification, investigation pivots, containment considerations and ticket summary. Keep it concise.',
- 'Chat': 'You are a helpful IT support assistant. Reply directly, safely and clearly with practical steps, and one targeted clarifying question when appropriate. Keep it concise.',
- 'Sales': 'You are an experienced ethical MSSP account consultant. Produce useful, practical business writing appropriate to the task; avoid unsubstantiated claims, invented prices or guarantees. Keep it concise.',
-}
 
-def scenario_for(index, workload='mixed'):
+def normalize_categories(value=None):
+    """Validate selection and use catalog order for reproducible interleaving."""
+    if value is None:
+        return list(CATEGORY_IDS)
+    if not isinstance(value, list) or not value:
+        raise ValueError('Select at least one prompt type')
+    if any(not isinstance(item, str) or item not in CATEGORY_IDS for item in value):
+        raise ValueError('Unknown prompt type in enabled_categories')
+    if len(value) != len(set(value)):
+        raise ValueError('Prompt type selection contains duplicates')
+    return [category for category in CATEGORY_IDS if category in value]
+
+
+def prompt_types():
+    """Expose the same catalog used by generation to the Settings page."""
+    return {'categories': [
+        {'id': category, 'label': label, 'description': description,
+         'system_prompt': prompt,
+         'mixed_cases': len(PROMPTS) if category == 'Interface' else
+                        len(SIEM_CASES) if category == 'SIEM' else len(MIXED_CASES[category]),
+         'deep_cases': sum(case['category'] == category for case in DEEP_CASES + EXTRA_DEEP_CASES)}
+        for category, label, description, prompt in PROMPT_TYPES],
+        'default_enabled': list(CATEGORY_IDS)}
+
+
+def scenario_for(index, workload='mixed', enabled_categories=None):
     if workload == 'chat20':
         case=CONVERSATION_CASES[index % len(CONVERSATION_CASES)]
         return case['category'], case['title'], case['prompt'], case['checks']
     if workload == 'agentic12':
         case=AGENTIC_CASES[index % len(AGENTIC_CASES)]
         return case['category'], case['title'], case['prompt'], case['checks']
+    selected = normalize_categories(enabled_categories)
+    category = selected[index % len(selected)]
+    variant = index // len(selected)
     if workload == 'deep20':
-        case=DEEP_CASES[index % len(DEEP_CASES)]
-        return case['category'], case['title'], case['prompt'], case['checks']
-    category = ('Interface', 'SIEM', 'Chat', 'Sales')[index % 4]
-    variant = index // 4
+        pool = [case for case in DEEP_CASES + EXTRA_DEEP_CASES if case['category'] == category]
+        case = pool[variant % len(pool)]
+        return category, case['title'], case['prompt'], case['checks']
     if category == 'Interface':
         title, device, interface, evidence = PROMPTS[variant % len(PROMPTS)]
         question = (f'Customer site {variant+1:02d}. Alert: {title}\nDevice: {device}\nInterface: {interface}\n'
                     f'Evidence: {evidence}\nGive triage, commands, next actions, escalation and a brief ServiceNow note.')
     else:
-        pool = {'SIEM': SIEM_CASES, 'Chat': CHAT_CASES, 'Sales': SALES_CASES}[category]
+        pool = SIEM_CASES if category == 'SIEM' else MIXED_CASES[category]
         title, evidence = pool[variant % len(pool)]
         question = f'Case {variant+1:02d}: {evidence}'
     return category, title, question, []
@@ -302,7 +303,7 @@ def invoke_model(host, port, payload, timeout, api_key=''):
         endpoint_url(host,port,'chat/completions'),
         data=json.dumps(payload).encode('utf-8'),
         headers=headers, method='POST')
-    with urllib.request.urlopen(req, timeout=timeout) as res:
+    with open_endpoint(req, timeout=timeout) as res:
         return json.load(res)
 
 
@@ -312,14 +313,23 @@ DEEP_SYSTEM_PROMPTS = {
  'Chat': 'You are an experienced enterprise IT support engineer. Respond to the latest turn of the provided conversation, take account of previous messages and user constraints, and provide a safe and practical step-by-step resolution with a concise explanation and clear escalation or rollback conditions. Never fabricate actions already performed.',
  'Sales': 'You are a rigorous MSSP solutions consultant. Work through numerical assumptions accurately; distinguish calculations from unknown commercial inputs, avoid invented prices, and develop a realistic decision-ready recommendation with explicit caveats and measurable next steps. Explain the important assumptions and checks in the final answer.'
 }
+DEEP_SYSTEM_PROMPTS.update(EXTRA_DEEP_SYSTEM_PROMPTS)
+# Generic Chat/Sales roles also apply to their reasoning cases; keep the richer
+# evidence/check requirements rather than accidentally replacing them with the
+# unchanged regular prompt sent by older clients.
+DEEP_SYSTEM_PROMPTS['Chat'] = SYSTEM_PROMPTS['Chat'] + ' Analyze the supplied constraints and conversation, explain important decision points and provide a practical answer without inventing facts.'
+DEEP_SYSTEM_PROMPTS['Sales'] = SYSTEM_PROMPTS['Sales'] + ' Check numerical assumptions carefully and give a decision-ready recommendation with explicit caveats and measurable next steps.'
 AGENTIC_SYSTEM_PROMPT = '''You are a senior Python engineer working through a stateful, multi-phase software task. Treat prior phase outputs as working project context, but verify them instead of blindly trusting them. Make concrete, executable recommendations and code when requested. Preserve acceptance criteria, surface contradictions, do not claim to have run commands you did not run, and leave a clear handoff for the next phase.'''
 CONVERSATION_SYSTEM_PROMPT = '''You are a helpful IT support assistant in an ongoing chat. Use the complete prior conversation as context, respond naturally to the latest user message, and do not repeat questions that were already answered. Give one or two practical next steps, distinguish evidence from guesses, protect secrets, and keep the reply concise enough for a real-time support conversation. Do not claim to have performed actions.'''
 
 
-def investigate(index, host, port, model, max_tokens, temperature, timeout, gate, workload='mixed', api_key='', prompt_overrides=None, conversation_context=''):
-    category, scenario, question, checks = scenario_for(index, workload)
+def investigate(index, host, port, model, max_tokens, temperature, timeout, gate, workload='mixed', api_key='', prompt_overrides=None, conversation_context='', enabled_categories=None):
+    category, scenario, question, checks = scenario_for(index, workload, enabled_categories)
     defaults = CONVERSATION_SYSTEM_PROMPT if workload=='chat20' else (AGENTIC_SYSTEM_PROMPT if workload=='agentic12' else (DEEP_SYSTEM_PROMPTS if workload=='deep20' else SYSTEM_PROMPTS))
-    system_prompt = (prompt_overrides or {}).get(category) or (defaults if isinstance(defaults,str) else defaults[category])
+    override = (prompt_overrides or {}).get(category)
+    if workload == 'deep20' and override == SYSTEM_PROMPTS.get(category):
+        override = None
+    system_prompt = override or (defaults if isinstance(defaults,str) else defaults[category])
     if conversation_context:
         question = 'PROJECT CONTEXT FROM EARLIER PHASES:\n'+conversation_context+'\n\nCURRENT PHASE:\n'+question
     payload = {'model':model, 'messages':[{'role':'system','content':system_prompt},
@@ -390,12 +400,13 @@ def grouped_results(results):
 
 def save_run(summary, results, settings):
     with DB_LOCK, connect_db() as db:
-        db.execute('''INSERT INTO runs (id,timestamp,engine,port,host,model,concurrency,max_tokens,timeout,temperature,wall_seconds,aggregate_tokens_per_second,succeeded,total,avg_request_seconds,output_tokens,max_inflight,workload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(
+        db.execute('''INSERT INTO runs (id,timestamp,engine,port,host,model,concurrency,max_tokens,timeout,temperature,wall_seconds,aggregate_tokens_per_second,succeeded,total,avg_request_seconds,output_tokens,max_inflight,workload,enabled_categories) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(
             summary['run_id'],summary['timestamp'],summary['engine'],settings['port'],settings['host'],
             settings['model'], settings['concurrency'],settings['max_tokens'],
             settings['timeout'],settings['temperature'], summary['wall_seconds'],
             summary['aggregate_tokens_per_second'],summary['succeeded'],summary['total'],
-            summary['avg_request_seconds'],summary['output_tokens'],settings['max_inflight'],settings['workload']))
+            summary['avg_request_seconds'],summary['output_tokens'],settings['max_inflight'],settings['workload'],
+            json.dumps(settings['enabled_categories'])))
         db.executemany('''INSERT INTO requests (
           run_id,request_index,category,scenario,system_prompt,user_prompt,ok,seconds,
                     completion_tokens,prompt_tokens,tokens_per_second,finish_reason,content,reasoning,error,review,reasoning_tokens,review_guide,judge_score,judge_reason
@@ -411,6 +422,8 @@ def rowdict(row):
     d=dict(row)
     if 'ok' in d: d['ok']=bool(d['ok'])
     if 'request_index' in d: d['index']=d.pop('request_index')
+    if d.get('enabled_categories') is not None:
+        d['enabled_categories'] = json.loads(d['enabled_categories'])
     return d
 
 
@@ -422,7 +435,7 @@ def load_history():
             COALESCE(SUM(CASE WHEN q.review='unreviewed' THEN 1 ELSE 0 END),0) AS unreviewed
             FROM runs r LEFT JOIN requests q ON q.run_id=r.id
             GROUP BY r.id ORDER BY r.timestamp DESC, r.rowid DESC LIMIT 300''').fetchall()
-    return [dict(x) for x in rows]
+    return [rowdict(x) for x in rows]
 
 
 def load_run(run_id):
@@ -432,7 +445,7 @@ def load_run(run_id):
         requests=db.execute('SELECT * FROM requests WHERE run_id=? ORDER BY request_index',(run_id,)).fetchall()
     rlist=[rowdict(q) for q in requests]
     reason_reports=[x['reasoning_tokens'] for x in rlist if x.get('reasoning_tokens') is not None]
-    return {**dict(run),'results':rlist,'groups':grouped_results(rlist),
+    return {**rowdict(run),'results':rlist,'groups':grouped_results(rlist),
             'reported_reasoning_tokens':sum(reason_reports) if reason_reports else None,
             'reasoning_reported_requests':len(reason_reports),
             'truncated':sum(x['finish_reason']=='length' for x in rlist),
@@ -448,11 +461,19 @@ def set_review(run_id, index, verdict):
         return cur.rowcount>0
 
 
+def csv_cell(value):
+    """Keep untrusted prompts/model text from becoming spreadsheet formulas."""
+    if isinstance(value, str) and (value.startswith(('\t', '\r', '\n')) or
+                                   value.lstrip().startswith(('=', '+', '-', '@'))):
+        return "'" + value
+    return value
+
+
 def export_csv(run_id):
     run=load_run(run_id)
     if run is None: return None
     cols=['timestamp','engine','model','host','port','concurrency','max_inflight','wall_seconds',
-          'aggregate_tokens_per_second','succeeded','total','workload','correct','incorrect','unreviewed',
+          'aggregate_tokens_per_second','succeeded','total','workload','enabled_categories','correct','incorrect','unreviewed',
           'index','category','scenario','ok','review','seconds','completion_tokens',
           'prompt_tokens','tokens_per_second','finish_reason','system_prompt','user_prompt',
           'content','reasoning','reasoning_tokens','review_guide','judge_score','judge_reason','error']
@@ -460,7 +481,8 @@ def export_csv(run_id):
     writer=csv.DictWriter(buf,fieldnames=cols)
     writer.writeheader()
     for r in run['results']:
-        writer.writerow({k:(r[k] if k in r else run.get(k,'')) for k in cols})
+        writer.writerow({k:csv_cell(json.dumps(run['enabled_categories']) if k == 'enabled_categories'
+                                  else r[k] if k in r else run.get(k,'')) for k in cols})
     return buf.getvalue().encode('utf-8-sig')
 HTML = (Path(__file__).parent / 'index.html').read_text(encoding='utf-8')
 
@@ -480,7 +502,7 @@ def run_benchmark(run_id, settings):
                     j=JOBS[run_id];j['completed']+=1;j['successes']+=int(r['ok']);j['errors']+=int(not r['ok'])
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(n,settings['max_inflight']),thread_name_prefix='llm') as pool:
-                futures=[pool.submit(investigate,i,settings['host'],settings['port'],settings['model'],settings['max_tokens'],settings['temperature'],settings['timeout'],gate,settings['workload'],settings['api_key'],settings['prompt_overrides']) for i in range(n)]
+                futures=[pool.submit(investigate,i,settings['host'],settings['port'],settings['model'],settings['max_tokens'],settings['temperature'],settings['timeout'],gate,settings['workload'],settings['api_key'],settings['prompt_overrides'],enabled_categories=settings['enabled_categories']) for i in range(n)]
                 gate.set()
                 for f in concurrent.futures.as_completed(futures):
                     r=judge_result(f.result(),settings['judge']); results.append(r)
@@ -511,6 +533,64 @@ def run_benchmark(run_id, settings):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        super().end_headers()
+
+    def trusted_request(self):
+        """Keep browser requests on the local dashboard's own origin.
+
+        Host validation also prevents a DNS-rebinding page from reaching saved
+        API keys or using the backend as an authenticated inference proxy.
+        """
+        try:
+            hosts = self.headers.get_all('Host', [])
+            if len(hosts) != 1:
+                raise ValueError('Expected one Host header')
+            raw = hosts[0]
+            if any(char.isspace() for char in raw):
+                raise ValueError('Invalid Host header')
+            target = urlsplit('http://' + raw)
+            hostname = target.hostname
+            if not hostname or target.username or target.password or target.path or target.query or target.fragment:
+                raise ValueError('Invalid Host header')
+            allowed = hostname.lower() == 'localhost'
+            try:
+                allowed = allowed or ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                pass
+            bind_host = str(self.server.server_address[0]).lower()
+            if bind_host not in ('0.0.0.0', '::', ''):
+                allowed = allowed or hostname.lower() == bind_host
+            if CONFIG.host not in ('0.0.0.0', '::', ''):
+                allowed = allowed or hostname.lower() == CONFIG.host.lower()
+            # Docker may publish this service on a different host port. Trust
+            # the local Host authority and compare Origin against that address.
+            port = target.port if target.port is not None else 80
+            if not allowed or not 1 <= port <= 65535:
+                raise ValueError('Use the configured local dashboard address')
+            dashboard_navigation = (self.command == 'GET' and urlparse(self.path).path == '/' and
+                                    self.headers.get('Sec-Fetch-Mode') == 'navigate' and
+                                    self.headers.get('Sec-Fetch-Dest') == 'document')
+            if self.headers.get('Sec-Fetch-Site') == 'cross-site' and not dashboard_navigation:
+                raise ValueError('Cross-site requests are not allowed')
+            origins = self.headers.get_all('Origin', [])
+            if len(origins) > 1:
+                raise ValueError('Expected one Origin header')
+            if origins:
+                origin = urlsplit(origins[0])
+                if (origin.scheme != 'http' or origin.hostname != hostname or
+                        (origin.port or 80) != port or origin.path or origin.query or origin.fragment or
+                        origin.username or origin.password):
+                    raise ValueError('Cross-origin requests are not allowed')
+            return True
+        except ValueError as exc:
+            self.json_response(403, {'error': str(exc)})
+            return False
+
     def json_response(self, code, obj):
         body=json.dumps(obj,ensure_ascii=False).encode('utf-8')
         try:
@@ -524,6 +604,8 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
+        if not self.trusted_request():
+            return
         parsed=urlparse(self.path)
         path=parsed.path
         if path=='/':
@@ -534,16 +616,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Content-Length',str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif path=='/api/config':
+            self.json_response(200, CONFIG.public_config())
+        elif path=='/api/prompt-types':
+            self.json_response(200,prompt_types())
         elif path=='/api/models':
             try:
                 args=parse_qs(parsed.query)
-                host=args.get('host',['host.docker.internal'])[0]
+                host=args.get('host',[DEFAULT_ENGINE_HOST])[0]
                 port_text=args.get('port',['1234'])[0].strip()
                 port=int(port_text) if port_text else 0
                 profile_id=args.get('profile_id',[''])[0]
                 api_key=load_engine_key(profile_id) if profile_id else self.headers.get('X-LLM-API-Key','')
                 req=urllib.request.Request(endpoint_url(host,port,'models'),headers={'Authorization':'Bearer '+api_key} if api_key else {})
-                with urllib.request.urlopen(req,timeout=12) as res:
+                with open_endpoint(req,timeout=12) as res:
                     data=json.load(res)
                 self.json_response(200,{'models':[m['id'] for m in data.get('data',[])]})
             except Exception as exc:
@@ -572,7 +658,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response(404,{'error':'No such saved run'});return
             self.send_response(200)
             self.send_header('Content-Type','text/csv; charset=utf-8')
-            self.send_header('Content-Disposition',f'attachment; filename="benchmark-{run_id[:8]}.csv"')
+            self.send_header('Content-Disposition',f'attachment; filename="{APP_SLUG}-{run_id[:8]}.csv"')
             self.send_header('Content-Length',str(len(csv_content)))
             self.end_headers()
             self.wfile.write(csv_content)
@@ -580,11 +666,17 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(404,{'error':'Unknown endpoint'})
 
     def do_POST(self):
+        if not self.trusted_request():
+            return
         if self.path not in ('/api/run','/api/review','/api/engine-key','/api/engine-key/delete','/api/test-connection'):
             self.json_response(404,{'error':'Unknown endpoint'});return
+        if self.headers.get_content_type() != 'application/json':
+            self.json_response(415, {'error': 'Content-Type must be application/json'});return
+        if self.headers.get('Transfer-Encoding') or len(self.headers.get_all('Content-Length', [])) != 1:
+            self.json_response(400, {'error': 'Expected one Content-Length header and no Transfer-Encoding'});return
         try:
             length=int(self.headers.get('Content-Length','0'))
-            if not 0<length<=12000: raise ValueError('Invalid request size')
+            if not 0<length<=131072: raise ValueError('Invalid request size (maximum 128 KiB)')
             args=json.loads(self.rfile.read(length))
             if not isinstance(args,dict): raise ValueError('Expected JSON object')
         except (ValueError,TypeError,json.JSONDecodeError) as exc:
@@ -601,7 +693,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif profile_id:
                     api_key=load_engine_key(profile_id)
                 req=urllib.request.Request(endpoint_url(host,port,'models'),headers={'Authorization':'Bearer '+api_key} if api_key else {})
-                with urllib.request.urlopen(req,timeout=12) as res: data=json.load(res)
+                with open_endpoint(req,timeout=12) as res: data=json.load(res)
                 models=[m.get('id') for m in data.get('data',[]) if m.get('id')]
                 self.json_response(200,{'connected':True,'models':models,'model_count':len(models)})
             except Exception as exc:
@@ -638,7 +730,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            host=str(args.get('host','host.docker.internal')).strip()
+            host=str(args.get('host',DEFAULT_ENGINE_HOST)).strip()
             port=int(args.get('port',0) or 0)
             n=int(args['concurrency'])
             max_inflight=int(args.get('max_inflight',n))
@@ -659,6 +751,13 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('Agentic Python suite requires exactly 12 sequential phases')
             if workload=='chat20' and n!=20:
                 raise ValueError('Conversation speed suite requires exactly 20 sequential messages')
+            if workload in ('mixed', 'deep20'):
+                if 'enabled_categories' in args and args['enabled_categories'] is None:
+                    raise ValueError('Prompt type selection must be a non-empty array')
+                enabled_categories = normalize_categories(args.get('enabled_categories'))
+            else:
+                # Fixed sequential narratives retain every phase/message.
+                enabled_categories = []
             specified=str(args.get('engine',''))
             profile_id=str(args.get('profile_id','')).strip()
             api_key=str(args.get('api_key','')).strip()
@@ -669,18 +768,25 @@ class Handler(BaseHTTPRequestHandler):
             prompt_overrides=args.get('prompt_overrides',{})
             if not isinstance(prompt_overrides,dict):
                 raise ValueError('Prompt overrides must be an object')
-            prompt_overrides={str(k):str(v)[:10000] for k,v in prompt_overrides.items() if str(v).strip()}
+            if any(k not in CATEGORY_IDS or not isinstance(v, str) or len(v) > 10000
+                   for k, v in prompt_overrides.items()):
+                raise ValueError('Prompt overrides require known prompt types and strings of at most 10000 characters')
+            prompt_overrides={k:v.strip() for k,v in prompt_overrides.items() if v.strip()}
             judge=args.get('judge',{})
             if not isinstance(judge,dict): raise ValueError('Judge settings must be an object')
-            judge={'enabled':bool(judge.get('enabled',False)),'host':valid_host(str(judge.get('host','host.docker.internal'))),'port':int(judge.get('port',1234)),'model':str(judge.get('model','')),'api_key':str(judge.get('apiKey','')),'timeout':120}
-            if judge['enabled'] and (not judge['model'] or not 1<=judge['port']<=65535):
-                raise ValueError('Enabled judge requires a model and valid port')
-        except (ValueError,TypeError,KeyError) as exc:
+            judge={'enabled':bool(judge.get('enabled',False)),'host':str(judge.get('host','')).strip(),
+                   'port':int(judge.get('port',0) or 0),'model':str(judge.get('model','')).strip(),
+                   'api_key':str(judge.get('apiKey','')),'timeout':120}
+            if judge['enabled']:
+                endpoint_url(judge['host'],judge['port'],'chat/completions')
+                if not 0 < len(judge['model']) <= 300:
+                    raise ValueError('Enabled judge requires a model')
+        except (ValueError,TypeError,KeyError,RuntimeError) as exc:
             self.json_response(400,{'error':str(exc)});return
         if not RUN_LOCK.acquire(blocking=False):
             self.json_response(409,{'error':'Another benchmark is already running'});return
         run_id=uuid.uuid4().hex
-        settings={'host':host,'port':port,'model':model,'concurrency':n,'max_inflight':max_inflight,'max_tokens':max_tokens,'timeout':timeout,'temperature':temperature,'specified_engine':specified,'workload':workload,'api_key':api_key,'prompt_overrides':prompt_overrides,'judge':judge}
+        settings={'host':host,'port':port,'model':model,'concurrency':n,'max_inflight':max_inflight,'max_tokens':max_tokens,'timeout':timeout,'temperature':temperature,'specified_engine':specified,'workload':workload,'api_key':api_key,'prompt_overrides':prompt_overrides,'judge':judge,'enabled_categories':enabled_categories}
         with JOB_LOCK:
             JOBS[run_id]={'run_id':run_id,'state':'running','started_at':time.perf_counter(),
                           'completed':0,'successes':0,'errors':0,'total':n,'error':''}
@@ -697,14 +803,23 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-if __name__=='__main__':
-    init_db()
-    server=ThreadingHTTPServer((APP_HOST,APP_PORT),Handler)
-    print(f'ModelRig v7.2 — Deep reasoning + history — http://{APP_HOST}:{APP_PORT}')
+def main():
+    try:
+        init_db()
+        server=ThreadingHTTPServer((APP_HOST,APP_PORT),Handler)
+    except (OSError, sqlite3.Error) as exc:
+        raise SystemExit(f'Unable to start {APP_NAME}: {exc}') from None
+    browser_host = '127.0.0.1' if APP_HOST == '0.0.0.0' else APP_HOST
+    dashboard_url = f'http://{browser_host}:{APP_PORT}'
+    print(f'{APP_NAME} v{VERSION} — Configurable benchmarks + history — {dashboard_url}')
     print(f'History database: {DB_PATH}')
     print('Press Ctrl+C to stop.')
-    if os.environ.get('LLM_LAB_NO_BROWSER','1')!='1':
-        webbrowser.open(f'http://{APP_HOST}:{APP_PORT}')
+    if CONFIG.open_browser:
+        webbrowser.open(dashboard_url)
     try: server.serve_forever()
     except KeyboardInterrupt: print('\nStopped.')
     finally: server.server_close()
+
+
+if __name__=='__main__':
+    main()

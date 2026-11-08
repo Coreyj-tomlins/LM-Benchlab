@@ -1,16 +1,14 @@
-name: llm-lab
+name: lm-benchlab
 services:
   lab:
     build: .
-    image: modelrig:7.2
-    container_name: llm-concurrency-lab
+    image: lm-benchlab:local
     labels:
-      org.opencontainers.image.title: ModelRig
-      org.opencontainers.image.version: "7.2"
+      org.opencontainers.image.title: LM Benchlab
     restart: unless-stopped
     init: true
     ports:
-      - "127.0.0.1:8768:8768"
+      - "127.0.0.1:${LM_BENCHLAB_PORT:-${MODELRIG_PORT:-8768}}:8768"
     volumes:
       - history:/data
     networks:
@@ -20,12 +18,16 @@ services:
     cap_drop:
       - ALL
     environment:
-      - APP_HOST=0.0.0.0
-      - APP_PORT=8768
-      - LLM_LAB_NO_BROWSER=1
-      - LLM_LAB_MASTER_KEY=${LLM_LAB_MASTER_KEY:-}
+      - LM_BENCHLAB_HOST=0.0.0.0
+      - LM_BENCHLAB_PORT=8768
+      - LM_BENCHLAB_NO_BROWSER=1
+      - LM_BENCHLAB_DEFAULT_ENGINE_HOST=${LM_BENCHLAB_DEFAULT_ENGINE_HOST-${LLM_LAB_DEFAULT_ENGINE_HOST:-host.docker.internal}}
+      - LM_BENCHLAB_MASTER_KEY=${LM_BENCHLAB_MASTER_KEY-${LLM_LAB_MASTER_KEY:-}}
 volumes:
   history:
+    # Keep the existing data volume across the project rename.
+    name: llm-lab_history
 networks:
   benchmark:
+    # Existing inference containers may already be attached to this network.
     name: llm-lab-net

@@ -1,5 +1,10 @@
-__pycache__/
-*.pyc
-*.sqlite3
-.git/
-*.zip
+# Only application source and its dependency manifest enter the build context.
+*
+!Dockerfile
+!.dockerignore
+!app.py
+!config.py
+!complex_cases.py
+!prompt_catalog.py
+!index.html
+!requirements.txt
